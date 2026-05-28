@@ -12,17 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Thin recipe-boundary builders.
+
+Recipes still receive ``ConfigNode`` from YAML; these helpers normalise that
+into the typed component configs (or ``(callable, kwargs)`` pairs for the
+``_target_`` escape hatch) before delegating to the component ``build_*``
+functions.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from nemo_automodel.components.checkpoint import build_checkpoint_config as _build_checkpoint_config
+from nemo_automodel.components.checkpoint.api import build_checkpoint_config as _build_checkpoint_config
+from nemo_automodel.components.loggers.api import build_mlflow as _build_mlflow
 from nemo_automodel.components.loggers.api import build_wandb as _build_wandb
-from nemo_automodel.components.loss import build_loss_fn as _build_loss_fn
-from nemo_automodel.components.optim import build_lr_scheduler as _build_lr_scheduler
-from nemo_automodel.components.optim import build_optimizer as _build_optimizer
-from nemo_automodel.components.training import build_step_scheduler as _build_step_scheduler
+from nemo_automodel.components.loggers.config import MLflowConfig, WandbConfig
+from nemo_automodel.components.loss.api import build_loss_fn as _build_loss_fn
+from nemo_automodel.components.optim.api import build_lr_scheduler as _build_lr_scheduler
+from nemo_automodel.components.optim.api import build_optimizer as _build_optimizer
+from nemo_automodel.components.optim.config import LRSchedulerConfig
+from nemo_automodel.components.training.api import build_step_scheduler as _build_step_scheduler
+from nemo_automodel.components.training.config import StepSchedulerConfig
 
 
 def _as_dict(cfg: Any | None) -> dict[str, Any]:
@@ -36,11 +48,12 @@ def _as_dict(cfg: Any | None) -> dict[str, Any]:
 
 
 def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Extract ``(_target_, kwargs)`` from a YAML ConfigNode or mapping."""
     if hasattr(cfg, "to_dict") or isinstance(cfg, Mapping):
-        cfg_dict = _as_dict(cfg)
-        target = cfg_dict.pop("_target_", None)
+        d = _as_dict(cfg)
+        target = d.pop("_target_", None)
         if target is not None:
-            return target, cfg_dict
+            return target, d
     target = getattr(cfg, "_target_", None)
     if target is not None:
         return target, {}
@@ -51,12 +64,7 @@ def _callable_and_kwargs(cfg: Any) -> tuple[Callable[..., Any], dict[str, Any]]:
     raise AttributeError("Config must provide _target_, be callable, or provide instantiate()")
 
 
-def build_checkpoint_config(
-    cfg_ckpt: Any,
-    cache_dir: str | None,
-    model_repo_id: str | None,
-    is_peft: bool,
-):
+def build_checkpoint_config(cfg_ckpt: Any, cache_dir: str | None, model_repo_id: str | None, is_peft: bool):
     return _build_checkpoint_config(
         checkpoint_kwargs=_as_dict(cfg_ckpt) if cfg_ckpt is not None else None,
         cache_dir=cache_dir,
@@ -66,36 +74,27 @@ def build_checkpoint_config(
 
 
 def build_loss_fn(cfg_loss: Any) -> Any:
-    loss_factory, loss_kwargs = _callable_and_kwargs(cfg_loss)
-    return _build_loss_fn(loss_factory=loss_factory, loss_kwargs=loss_kwargs)
+    factory, kwargs = _callable_and_kwargs(cfg_loss)
+    return _build_loss_fn(loss_factory=factory, loss_kwargs=kwargs)
 
 
 def build_optimizer(model: Any, cfg_opt: Any, distributed_config: Any, device_mesh: Any):
-    optimizer_factory, optimizer_kwargs = _callable_and_kwargs(cfg_opt)
+    factory, kwargs = _callable_and_kwargs(cfg_opt)
     return _build_optimizer(
         model=model,
-        optimizer_factory=optimizer_factory,
-        optimizer_kwargs=optimizer_kwargs,
+        optimizer_factory=factory,
+        optimizer_kwargs=kwargs,
         distributed_config=distributed_config,
         device_mesh=device_mesh,
     )
 
 
 def build_lr_scheduler(cfg: Any, optimizer: Any, step_scheduler: Any):
-    from nemo_automodel.components.optim.config import LRSchedulerConfig
-
-    if cfg is None:
-        return _build_lr_scheduler(config=None, optimizer=optimizer, step_scheduler=step_scheduler)
-    return _build_lr_scheduler(
-        config=LRSchedulerConfig(**_as_dict(cfg)),
-        optimizer=optimizer,
-        step_scheduler=step_scheduler,
-    )
+    config = None if cfg is None else LRSchedulerConfig(**_as_dict(cfg))
+    return _build_lr_scheduler(config=config, optimizer=optimizer, step_scheduler=step_scheduler)
 
 
 def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_batch_size: int):
-    from nemo_automodel.components.training.config import StepSchedulerConfig
-
     if cfg is None:
         config = None
     else:
@@ -111,20 +110,16 @@ def build_step_scheduler(cfg: Any, dataloader: Any, dp_group_size: int, local_ba
 
 
 def _model_name_from_cfg(cfg_model: Any) -> str | None:
-    pretrained = cfg_model.get("pretrained_model_name_or_path", None)
-    if pretrained is not None:
-        return pretrained
-    model_config = cfg_model.get("config", None)
-    if model_config is not None:
-        if isinstance(model_config, str):
-            return model_config
-        return model_config.get("pretrained_model_name_or_path", None)
-    return None
+    name = cfg_model.get("pretrained_model_name_or_path", None)
+    if name is not None:
+        return name
+    nested = cfg_model.get("config", None)
+    if nested is None:
+        return None
+    return nested if isinstance(nested, str) else nested.get("pretrained_model_name_or_path", None)
 
 
 def build_wandb(cfg: Any):
-    from nemo_automodel.components.loggers.config import WandbConfig
-
     model_name = _model_name_from_cfg(cfg.model) if hasattr(cfg, "model") else None
     return _build_wandb(
         config=WandbConfig(**_as_dict(cfg.wandb)),
@@ -134,13 +129,9 @@ def build_wandb(cfg: Any):
 
 
 def build_mlflow(cfg: Any):
-    from nemo_automodel.components.loggers.api import build_mlflow as _build_mlflow
-    from nemo_automodel.components.loggers.config import MLflowConfig
-
     mlflow_dict = _as_dict(cfg.mlflow) if hasattr(cfg, "mlflow") and cfg.mlflow else {}
     if not mlflow_dict:
         return None
-    # Extract run_config; use to_yaml_dict if available (ConfigNode), else plain dict.
     run_config = cfg.to_yaml_dict(use_orig_values=True) if hasattr(cfg, "to_yaml_dict") else _as_dict(cfg)
     checkpoint_dir = cfg.get("checkpoint.checkpoint_dir", None) if hasattr(cfg, "get") else None
     return _build_mlflow(

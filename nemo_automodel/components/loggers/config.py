@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public config surface for the loggers component.
-
-Look here for the typed parameters that drive WandB, MLflow, and Comet.
-Look at ``api.py`` for the builder functions that consume these configs.
-"""
+"""Public, typed configs for the remote loggers (WandB, MLflow, Comet)."""
 
 from __future__ import annotations
 
@@ -25,22 +21,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class WandbConfig:
-    """User-facing WandB configuration (maps to the YAML ``wandb:`` block).
-
-    Fields are forwarded to ``wandb.init()``; any extra kwargs accepted by
-    ``wandb.init`` can be added here as needed.
-
-    Attributes:
-        project: WandB project name.
-        entity: WandB team / entity.  ``None`` uses the default from
-            the wandb config or ``WANDB_ENTITY`` env var.
-        name: Display name for the run.  When empty, the builder derives
-            one from the model name.
-        group: Group name for related runs.
-        tags: List of string tags attached to the run.
-        save_dir: Local directory for wandb files.
-        notes: Free-text notes shown in the WandB UI.
-    """
+    """Forwarded to ``wandb.init()`` (extra kwargs may be added as fields)."""
 
     project: str = "automodel"
     entity: str | None = None
@@ -53,22 +34,7 @@ class WandbConfig:
 
 @dataclass
 class MLflowConfig:
-    """User-facing MLflow configuration (maps to the YAML ``mlflow:`` block).
-
-    Attributes:
-        experiment_name: MLflow experiment name.
-        run_name: Display name for the run.
-        tracking_uri: MLflow tracking server URI.  ``None`` uses the
-            ``MLFLOW_TRACKING_URI`` env var or local ``./mlruns``.
-        artifact_location: Root artifact store URI for the experiment.
-        tags: Dictionary of string tags attached to the run.
-        resume: When ``True`` (default), look for a ``mlflow_run_id``
-            sidecar in the checkpoint dir and resume that run.
-        description: Free-text description shown in the MLflow UI
-            (sets the ``mlflow.note.content`` tag).
-        flatten_depth: Nesting depth for ``mlflow.log_params``.
-            ``1`` (default) splits one level; ``None`` is fully recursive.
-    """
+    """MLflow run configuration (sidecar resume gated by ``resume``)."""
 
     experiment_name: str = "automodel-experiment"
     run_name: str = ""
@@ -82,16 +48,7 @@ class MLflowConfig:
 
 @dataclass
 class CometConfig:
-    """User-facing Comet ML configuration.
-
-    Attributes:
-        project_name: Comet project name.
-        workspace: Comet workspace.  ``None`` uses the default.
-        api_key: Comet API key.  ``None`` reads from ``COMET_API_KEY`` env var.
-        experiment_name: Display name for this experiment run.
-        tags: List of string tags attached to the experiment.
-        auto_metric_logging: Enable Comet's automatic metric logging.
-    """
+    """Comet ML logger configuration."""
 
     project_name: str = "automodel"
     workspace: str | None = None
@@ -101,4 +58,4 @@ class CometConfig:
     auto_metric_logging: bool = False
 
 
-__all__ = ["WandbConfig", "MLflowConfig", "CometConfig"]
+__all__ = ["CometConfig", "MLflowConfig", "WandbConfig"]

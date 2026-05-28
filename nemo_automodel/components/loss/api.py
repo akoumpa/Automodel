@@ -17,37 +17,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from nemo_automodel.components.loss.config import (
-    FusedLinearCEConfig,
-    KDLossConfig,
-    LossConfig,
-    MaskedCrossEntropyConfig,
-    TEParallelCEConfig,
-)
+from nemo_automodel.components.loss.config import LossConfig
 
 if TYPE_CHECKING:
     from torch import nn
-
-
-def _get_loss_class(config: LossConfig) -> type:
-    """Map a typed config to its loss class (lazy imports to avoid heavy deps at module level)."""
-    if isinstance(config, MaskedCrossEntropyConfig):
-        from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
-
-        return MaskedCrossEntropy
-    if isinstance(config, FusedLinearCEConfig):
-        from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
-
-        return FusedLinearCrossEntropy
-    if isinstance(config, TEParallelCEConfig):
-        from nemo_automodel.components.loss.te_parallel_ce import TEParallelCrossEntropy
-
-        return TEParallelCrossEntropy
-    if isinstance(config, KDLossConfig):
-        from nemo_automodel.components.loss.kd_loss import KDLoss
-
-        return KDLoss
-    raise ValueError(f"Unknown loss config type: {type(config).__name__}. Use loss_factory for custom losses.")
 
 
 def build_loss_fn(
@@ -56,27 +29,9 @@ def build_loss_fn(
     loss_factory: Callable[..., nn.Module] | None = None,
     loss_kwargs: Mapping[str, Any] | None = None,
 ) -> nn.Module:
-    """Build a loss function.
-
-    Accepts either a ``LossConfig`` (preferred for external integrations)
-    or an explicit ``(loss_factory, loss_kwargs)`` pair (used by
-    ``_component_builders`` when resolving from YAML).
-
-    Args:
-        config: Typed loss config.  When provided, ``loss_factory`` and
-            ``loss_kwargs`` are derived from it.
-        loss_factory: Callable or class that creates the loss function.
-            Ignored when ``config`` is provided.
-        loss_kwargs: Optional keyword arguments passed to the loss factory.
-            Ignored when ``config`` is provided.
-
-    Returns:
-        Instantiated loss function.
-    """
+    """Build a loss function from a typed ``LossConfig`` or a ``(factory, kwargs)`` pair."""
     if config is not None:
-        loss_factory = _get_loss_class(config)
-        loss_kwargs = config.to_kwargs()
-    elif loss_factory is None:
+        return config.build()
+    if loss_factory is None:
         raise ValueError("Either config or loss_factory must be provided")
-
     return loss_factory(**dict(loss_kwargs or {}))

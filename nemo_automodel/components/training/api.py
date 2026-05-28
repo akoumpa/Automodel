@@ -30,22 +30,10 @@ def build_step_scheduler(
     dp_group_size: int,
     local_batch_size: int,
 ) -> StepScheduler:
-    """Build the step scheduler.
-
-    Args:
-        config: Step scheduler configuration.  ``None`` uses all defaults.
-        dataloader: The training dataloader.
-        dp_group_size: The size of the data parallel group.
-        local_batch_size: The size of the local batch.
-
-    Returns:
-        Configured StepScheduler.
-    """
-    if config is None:
-        config = StepSchedulerConfig()
-
-    kwargs = asdict(config)
-    kwargs["local_batch_size"] = local_batch_size
-    kwargs["dp_size"] = dp_group_size
-    kwargs["dataloader"] = dataloader
-    return StepScheduler(**kwargs)
+    """Build a ``StepScheduler``.  ``None`` config uses defaults."""
+    return StepScheduler(
+        **asdict(config or StepSchedulerConfig()),
+        local_batch_size=local_batch_size,
+        dp_size=dp_group_size,
+        dataloader=dataloader,
+    )

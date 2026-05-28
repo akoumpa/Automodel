@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builder functions for remote loggers (WandB, MLflow, Comet).
-
-Each builder accepts a typed config from ``config.py`` plus optional
-runtime arguments, and returns the initialised logger / run object.
-"""
+"""Builders for remote loggers (WandB, MLflow, Comet)."""
 
 from __future__ import annotations
 
@@ -32,23 +28,11 @@ def build_wandb(
     run_config: Mapping[str, Any] | None = None,
     model_name: str | None = None,
 ) -> Any:
-    """Initialise WandB and return the run.
-
-    Args:
-        config: WandB configuration.
-        run_config: Full training config dict logged to the WandB run.
-        model_name: Optional model name used to derive the run name
-            when ``config.name`` is empty.
-
-    Returns:
-        Initialised ``wandb.Run``.
-    """
+    """Initialise WandB and return the run."""
     import wandb
     from wandb import Settings
 
-    kwargs = asdict(config)
-    # Remove None values so wandb.init() uses its own defaults.
-    kwargs = {k: v for k, v in kwargs.items() if v is not None}
+    kwargs = {k: v for k, v in asdict(config).items() if v is not None}
     if kwargs.get("name", "") == "" and model_name:
         kwargs["name"] = "_".join(model_name.split("/")[-2:])
     return wandb.init(
@@ -59,24 +43,10 @@ def build_wandb(
 
 
 def build_comet(config: CometConfig) -> Any:
-    """Initialise Comet ML and return the logger.
-
-    Args:
-        config: Comet configuration.
-
-    Returns:
-        ``CometLogger`` instance (only active on rank 0).
-    """
+    """Initialise Comet ML and return the logger (rank-0 only inside ``CometLogger``)."""
     from nemo_automodel.components.loggers.comet_utils import CometLogger
 
-    return CometLogger(
-        project_name=config.project_name,
-        workspace=config.workspace,
-        api_key=config.api_key,
-        experiment_name=config.experiment_name,
-        tags=config.tags,
-        auto_metric_logging=config.auto_metric_logging,
-    )
+    return CometLogger(**asdict(config))
 
 
 def build_mlflow(
@@ -86,26 +56,16 @@ def build_mlflow(
 ) -> Any:
     """Initialise MLflow on rank 0 and start (or resume) a run.
 
-    Installs a ``sys.excepthook`` so crashed jobs report as FAILED rather
-    than FINISHED.  On non-rank-0 processes returns ``None``.
-
-    Args:
-        config: MLflow configuration.
-        checkpoint_dir: Checkpoint directory used to persist / read the
-            ``mlflow_run_id`` sidecar for run resumption.
-        run_config: Full training config dict logged as MLflow params
-            and as a ``config.yaml`` artifact.
-
-    Returns:
-        Active ``mlflow.entities.Run`` on rank 0, or ``None``.
+    Installs a ``sys.excepthook`` so crashed jobs report as FAILED.  Returns
+    ``None`` on non-rank-0 processes.
     """
-    import logging as _logging
+    import logging
     import os
     from pathlib import Path
 
     import torch.distributed as dist
 
-    _logger = _logging.getLogger(__name__)
+    _logger = logging.getLogger(__name__)
 
     if not (dist.is_initialized() and dist.get_rank() == 0):
         return None
@@ -130,13 +90,10 @@ def build_mlflow(
         experiment_id = "0"
 
     tags = dict(config.tags)
-
-    # Resume logic: env var always honoured; sidecar lookup gated by config.resume.
     sidecar = Path(checkpoint_dir) / "mlflow_run_id" if checkpoint_dir else None
     existing_run_id = os.environ.get("MLFLOW_RUN_ID") or (
         sidecar.read_text().strip() if config.resume and sidecar and sidecar.exists() else None
     )
-
     if config.description is not None:
         tags["mlflow.note.content"] = config.description
 
@@ -146,18 +103,14 @@ def build_mlflow(
         run_name=config.run_name,
         tags=tags,
     )
-
-    # Persist run_id for future resume.
     if existing_run_id is None and sidecar is not None:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(run.info.run_id)
 
-    # Install failure hook so crashed runs show as FAILED.
     from nemo_automodel.components.loggers.mlflow_utils import _install_mlflow_failure_hook
 
     _install_mlflow_failure_hook()
 
-    # Log config as params + artifact.
     if run_config is not None:
         config_dict = dict(run_config)
         if existing_run_id is None:
@@ -173,8 +126,7 @@ def build_mlflow(
 
     _logger.info(f"MLflow run started: {run.info.run_id}")
     _logger.info(f"View run at: {mlflow.get_tracking_uri()}/#/experiments/{experiment_id}/runs/{run.info.run_id}")
-
     return run
 
 
-__all__ = ["build_wandb", "build_mlflow", "build_comet"]
+__all__ = ["build_comet", "build_mlflow", "build_wandb"]

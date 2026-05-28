@@ -31,19 +31,8 @@ def build_checkpoint_config(
     model_repo_id: str | None,
     is_peft: bool,
 ) -> CheckpointingConfig:
-    """Build a checkpoint configuration.
-
-    Args:
-        checkpoint_kwargs: Optional keyword overrides from the YAML
-            ``checkpoint:`` block.
-        cache_dir: HF cache directory for the model.
-        model_repo_id: Model repository ID.
-        is_peft: Whether the model uses PEFT.
-
-    Returns:
-        Instantiated ``CheckpointingConfig`` ready for the checkpointer.
-    """
-    ckpt_kwargs = dict(
+    """Build a ``CheckpointingConfig`` from YAML overrides + runtime info."""
+    kwargs = dict(
         enabled=True,
         checkpoint_dir="checkpoints/",
         model_save_format="safetensors",
@@ -52,18 +41,15 @@ def build_checkpoint_config(
         save_consolidated=True,
         is_peft=is_peft,
     )
-    user_cfg = {}
-    if checkpoint_kwargs is not None:
-        user_cfg = dict(checkpoint_kwargs)
-        user_cfg.pop("restore_from", None)
-    if is_peft and user_cfg.get("model_save_format") == "torch_save":
+    user = dict(checkpoint_kwargs) if checkpoint_kwargs is not None else {}
+    user.pop("restore_from", None)
+    if is_peft and user.get("model_save_format") == "torch_save":
         logger.warning(
-            "PEFT checkpointing is not supported for `torch_save` format; "
-            "discarding user checkpoint config and using safetensors defaults "
+            "PEFT checkpointing is not supported for `torch_save`; using safetensors defaults "
             "(preserving `checkpoint_dir` if set)."
         )
-        if "checkpoint_dir" in user_cfg:
-            ckpt_kwargs["checkpoint_dir"] = user_cfg["checkpoint_dir"]
+        if "checkpoint_dir" in user:
+            kwargs["checkpoint_dir"] = user["checkpoint_dir"]
     else:
-        ckpt_kwargs |= user_cfg
-    return CheckpointingConfig(**ckpt_kwargs)
+        kwargs |= user
+    return CheckpointingConfig(**kwargs)
