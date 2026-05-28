@@ -12,17 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public, typed step scheduler configuration."""
+"""Typed step-scheduler configuration."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from torch.utils.data import DataLoader
+
+    from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 
 @dataclass
 class StepSchedulerConfig:
-    """YAML-configurable step-scheduler parameters.  Runtime values (``dataloader``,
-    ``dp_size``, ``local_batch_size``) are passed to ``build_step_scheduler``."""
+    """YAML-configurable step-scheduler parameters.  Runtime values (dataloader,
+    dp_size, local_batch_size) flow in through ``build``."""
 
     global_batch_size: int = 32
     num_epochs: int | None = 10
@@ -34,6 +40,16 @@ class StepSchedulerConfig:
     gc_every_steps: int | None = None
     start_step: int = 0
     start_epoch: int = 0
+
+    def build(self, dataloader: DataLoader, dp_group_size: int, local_batch_size: int) -> StepScheduler:
+        from nemo_automodel.components.training.step_scheduler import StepScheduler
+
+        return StepScheduler(
+            **asdict(self),
+            local_batch_size=local_batch_size,
+            dp_size=dp_group_size,
+            dataloader=dataloader,
+        )
 
 
 __all__ = ["StepSchedulerConfig"]

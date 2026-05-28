@@ -40,9 +40,8 @@ from nemo_automodel.components.training.utils import (
     prepare_for_final_backward,
     prepare_for_grad_accumulation,
 )
-from nemo_automodel.recipes._component_builders import build_wandb
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import build_distributed
 
 
 def _get_diffusion_microbatch_size(batch: Dict[str, Any]) -> int:
@@ -406,15 +405,17 @@ class TrainDiffusionRecipe(BaseRecipe):
     """Training recipe for diffusion models."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = self.cfg.dist_env.build()
         setup_logging()
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(
+                run_config=self.cfg.to_dict(), model_name=self.cfg.get("model.pretrained_model_name_or_path", None)
+            )
             if run is not None:
                 logging.info("🚀 View run at {}".format(run.url))
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .api import build_lr_scheduler, build_optimizer
 from .config import (
     AdamConfig,
     AdamWConfig,
@@ -34,8 +33,6 @@ __all__ = [
     "MuonConfig",
     "OptimizerConfig",
     "OptimizerParamScheduler",
-    "build_lr_scheduler",
-    "build_optimizer",
     "build_dion_optimizer",
     "is_dion_optimizer",
 ]

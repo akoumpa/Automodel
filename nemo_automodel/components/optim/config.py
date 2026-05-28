@@ -14,18 +14,28 @@
 
 """Public, typed optimizer + LR scheduler configs.
 
-``OptimizerConfig`` resolves a dotted-path factory for losses Automodel does
-not own; typed subclasses expose the full parameter surface for known
-optimizers.  Runtime construction lives in ``api.build_optimizer`` because it
-needs the model, distributed config, and device mesh.
+Each config carries its own ``build(...)`` that returns the optimizer (or LR
+scheduler).  Runtime objects (model, mesh, optimizer, step scheduler) flow in
+through the build args so the config dataclasses stay pure data.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import torch
+    from torch.distributed.device_mesh import DeviceMesh
+
+    from nemo_automodel.components.distributed.config import DistributedConfig
+    from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+    from nemo_automodel.components.training.step_scheduler import StepScheduler
 
 _RESERVED_FIELDS = frozenset({"name", "extra_kwargs"})
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -40,6 +50,23 @@ class OptimizerConfig:
     def to_kwargs(self) -> dict[str, Any]:
         d = {f.name: getattr(self, f.name) for f in fields(self) if f.name not in _RESERVED_FIELDS}
         return {**d, **self.extra_kwargs}
+
+    def _resolve_factory(self):
+        from importlib import import_module
+
+        module_name, cls_name = self.name.rsplit(".", 1)
+        return getattr(import_module(module_name), cls_name)
+
+    def build(
+        self,
+        model: torch.nn.Module,
+        distributed_config: DistributedConfig | None = None,
+        device_mesh: DeviceMesh | None = None,
+    ) -> list[torch.optim.Optimizer]:
+        """Build optimizers for ``model.parts`` (or ``[model]``)."""
+        return build_optimizer_from_factory(
+            self._resolve_factory(), self.to_kwargs(), model, distributed_config, device_mesh
+        )
 
 
 @dataclass
@@ -120,6 +147,95 @@ class LRSchedulerConfig:
     override_opt_param_scheduler: bool = False
     wsd_decay_steps: int | None = None
     lr_wsd_decay_style: str | None = None
+
+    def build(
+        self,
+        optimizer: list[torch.optim.Optimizer] | torch.optim.Optimizer,
+        step_scheduler: StepScheduler,
+    ) -> list[OptimizerParamScheduler]:
+        from dataclasses import asdict
+
+        from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
+
+        total_steps = (step_scheduler.num_epochs * len(step_scheduler.dataloader)) // step_scheduler.grad_acc_steps
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+
+        optimizers = optimizer if isinstance(optimizer, list) else [optimizer]
+        # Non-None fields on self override the per-optimizer computed defaults below.
+        overrides = {k: v for k, v in asdict(self).items() if v is not None}
+        schedulers = []
+        for opt in optimizers:
+            base_lr = opt.param_groups[0]["lr"]
+            base_wd = opt.param_groups[0].get("weight_decay", 0.0)
+            schedulers.append(
+                OptimizerParamScheduler(
+                    optimizer=opt,
+                    **{
+                        "init_lr": base_lr * 0.1,
+                        "max_lr": base_lr,
+                        "min_lr": base_lr * 0.01,
+                        "lr_warmup_steps": min(1000, total_steps // 10),
+                        "lr_decay_steps": total_steps,
+                        "start_wd": base_wd,
+                        "end_wd": base_wd,
+                        "wd_incr_steps": total_steps,
+                        "wsd_decay_steps": None,
+                        "lr_wsd_decay_style": None,
+                        **overrides,
+                    },
+                )
+            )
+        logger.info(
+            "Building LR scheduler with total_steps=%d, warmup_steps=%d, decay_style=%s",
+            total_steps,
+            schedulers[0].lr_warmup_steps,
+            self.lr_decay_style,
+        )
+        return schedulers
+
+
+def build_optimizer_from_factory(
+    factory,
+    kwargs: dict[str, Any],
+    model: torch.nn.Module,
+    distributed_config: DistributedConfig | None = None,
+    device_mesh: DeviceMesh | None = None,
+) -> list[torch.optim.Optimizer]:
+    """Shared optimizer construction (parts loop + dion + MegatronFSDP)."""
+    import torch
+
+    from nemo_automodel.components.distributed.config import MegatronFSDPConfig
+    from nemo_automodel.components.optim.utils import build_dion_optimizer, is_dion_optimizer
+    from nemo_automodel.shared.utils import dtype_from_str
+
+    kwargs = {
+        k: (dtype_from_str(v) if k in {"master_weight_dtype", "exp_avg_dtype", "exp_avg_sq_dtype"} and isinstance(v, str) else v)
+        for k, v in kwargs.items()
+    }
+    if device_mesh is not None and "tp" in device_mesh.mesh_dim_names and device_mesh["tp"].size() > 1:
+        kwargs["foreach"] = False  # TP does not support foreach
+
+    has_dion = is_dion_optimizer(factory)
+    optimizers = []
+    for part in getattr(model, "parts", [model]):
+        trainable = [p for p in part.parameters() if p.requires_grad]
+        assert trainable, "trainable_params cannot be empty"
+        opt = (
+            build_dion_optimizer(
+                optimizer_factory=factory, optimizer_kwargs=kwargs, model=part, distributed_mesh=device_mesh
+            )
+            if has_dion
+            else factory(params=trainable, **kwargs)
+        )
+        if isinstance(distributed_config, MegatronFSDPConfig) and torch.distributed.get_world_size() > 1:
+            assert not has_dion, "Dion optimizer does not support fully_shard_optimizer"
+            from nemo_automodel.components.distributed import megatron_fsdp
+
+            if megatron_fsdp.HAS_MEGATRON_FSDP:
+                opt = megatron_fsdp.fully_shard_optimizer(part, opt)
+        optimizers.append(opt)
+    return optimizers
 
 
 __all__ = [

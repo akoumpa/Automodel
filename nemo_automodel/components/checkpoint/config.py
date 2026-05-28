@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public config surface for the checkpoint component.
-
-Look here for the typed parameters that drive checkpointing behaviour.
-Look at ``api.py`` for the builder that consumes this config.
-"""
+"""Typed checkpoint configuration."""
 
 from __future__ import annotations
 
@@ -31,7 +27,6 @@ from nemo_automodel.components.checkpoint._backports.filesystem import Serializa
 
 
 def _is_geq_torch_2_9() -> bool:
-    """Check if the current torch version is greater than or equal to 2.9.0."""
     return parse(torch.__version__).base_version >= "2.9.0"
 
 
@@ -39,31 +34,29 @@ def _is_geq_torch_2_9() -> bool:
 class CheckpointingConfig:
     """Configuration for checkpointing."""
 
-    enabled: bool
-    checkpoint_dir: str | Path
-    model_save_format: str
-    model_cache_dir: str | Path
-    model_repo_id: str
-    save_consolidated: bool
-    is_peft: bool
-    model_state_dict_keys: list[str] = (
-        None  # copy of the model state dict keys before any parallelization. Kept for BW compatibility.
-    )
+    enabled: bool = True
+    checkpoint_dir: str | Path = "checkpoints/"
+    model_save_format: str = "safetensors"
+    model_cache_dir: str | Path | None = None
+    model_repo_id: str | None = None
+    save_consolidated: bool = True
+    is_peft: bool = False
+    # copy of the model state dict keys before any parallelization; kept for BW compat.
+    model_state_dict_keys: list[str] | None = None
     is_async: bool = False
     dequantize_base_checkpoint: bool | None = None
     original_model_root_dir: str | None = None
-    skip_task_head_prefixes_for_base_model: list[str] | None = (
-        None  # Parameter prefixes to skip when loading base model
-    )
-    single_rank_consolidation: bool = False  # If True, only rank 0 performs consolidation.
-    # This should be used for remote storage systems that don't support direct-append or non-sequential writes.
-    staging_dir: str | None = None  # Optional directory for staging files during consolidation.
-    # If provided, temp files will be created here instead of system temp. Useful when system temp has limited space.
-    v4_compatible: bool = False  # If True, save the original pretrained config.json (with quantization_config removed)
-    # instead of the in-memory v5 config.  Useful when downstream consumers (e.g. vLLM) expect a v4-format config.
-    diffusers_compatible: bool = False  # If True, use diffusers-compatible index filename
-    # (diffusion_pytorch_model.safetensors.index.json) so checkpoints are loadable via diffusers from_pretrained().
-    best_metric_key: str = "default"  # Validation metric key used to select the best checkpoint.
+    # Parameter prefixes to skip when loading base model.
+    skip_task_head_prefixes_for_base_model: list[str] | None = None
+    # If True, only rank 0 performs consolidation (needed for remote stores without append).
+    single_rank_consolidation: bool = False
+    # Optional staging directory for consolidation temp files.
+    staging_dir: str | None = None
+    # If True, save the original pretrained config.json for transformers v4 compatibility.
+    v4_compatible: bool = False
+    # If True, use diffusers-compatible index filename for from_pretrained() loading.
+    diffusers_compatible: bool = False
+    best_metric_key: str = "default"
 
     def __post_init__(self):
         """Convert a raw string such as "safetensors" into the right Enum."""
@@ -72,17 +65,19 @@ class CheckpointingConfig:
             f"Unsupported model save format: {self.model_save_format}. Supported formats: {formats}"
         )
         self.model_save_format = SerializationFormat[self.model_save_format.upper()]
-        if self.save_consolidated or False:
-            if not self.v4_compatible:
-                logging.warning(
-                    "save_consolidated=True but v4_compatible=False; "
-                    "checkpoint assets may be not compatible with transformers v4; "
-                    "[experimental] set --checkpoint.v4_compatible=True to enable"
-                )
-            else:
-                logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
+        if self.model_cache_dir is None:
+            from huggingface_hub import constants as hf_constants
 
-        # Async is only enabled for torch >= 2.9.0 currently because of large API changes in async DCP from 2.8.0 to 2.9.0
+            self.model_cache_dir = hf_constants.HF_HUB_CACHE
+        if self.save_consolidated and not self.v4_compatible:
+            logging.warning(
+                "save_consolidated=True but v4_compatible=False; "
+                "checkpoint assets may be not compatible with transformers v4; "
+                "[experimental] set --checkpoint.v4_compatible=True to enable"
+            )
+        elif self.save_consolidated:
+            logging.warning("[experimental] v4_compatible=True enables transformers v4 compatibility")
+
         if self.is_async and not _is_geq_torch_2_9():
             logging.error("Async mode is only supported for torch >= 2.9.0, disabling async mode")
             self.is_async = False

@@ -14,7 +14,6 @@
 
 """Tests for nemo_automodel.components.loss.config — LossConfig hierarchy."""
 
-import pytest
 
 from nemo_automodel.components.loss.config import (
     FusedLinearCEConfig,
@@ -77,8 +76,9 @@ class TestBuild:
         ).build()
         assert isinstance(loss, MaskedCrossEntropy)
 
-    def test_build_requires_config_or_factory(self):
-        from nemo_automodel.components.loss.api import build_loss_fn
+    def test_build_via_subclass(self):
+        from nemo_automodel.components.loss.kd_loss import KDLoss
 
-        with pytest.raises(ValueError, match="Either config or loss_factory"):
-            build_loss_fn()
+        loss = KDLossConfig(temperature=3.0).build()
+        assert isinstance(loss, KDLoss)
+        assert loss.temperature == 3.0

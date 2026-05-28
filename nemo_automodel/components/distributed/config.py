@@ -35,14 +35,32 @@ Usage:
     config = DDPConfig(activation_checkpointing=True)
 """
 
+from __future__ import annotations
+
 from dataclasses import InitVar, dataclass, fields
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy
 
+if TYPE_CHECKING:
+    from nemo_automodel.components.distributed.init_utils import DistInfo
+
 # Type alias for API signature
 DistributedConfig = Union["FSDP2Config", "MegatronFSDPConfig", "DDPConfig"]
+
+
+@dataclass
+class DistEnvConfig:
+    """``dist_env`` YAML block — torch.distributed init parameters."""
+
+    backend: str = "nccl"
+    timeout_minutes: int = 1
+
+    def build(self) -> DistInfo:
+        from nemo_automodel.components.distributed.init_utils import initialize_distributed
+
+        return initialize_distributed(backend=self.backend, timeout_minutes=self.timeout_minutes)
 
 
 @dataclass

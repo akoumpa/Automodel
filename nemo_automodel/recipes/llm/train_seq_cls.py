@@ -23,26 +23,20 @@ import wandb
 
 from nemo_automodel._transformers.mfu import AutoMFU
 from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.loggers.log_utils import setup_logging
 from nemo_automodel.components.loggers.metric_logger import MetricsSample, build_metric_logger
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
+from nemo_automodel.components.optim.config import build_optimizer_from_factory
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.components.training.utils import clip_grad_norm
 from nemo_automodel.components.utils.flops_utils import calculate_mfu
 from nemo_automodel.components.utils.model_utils import filter_forward_kwargs
 from nemo_automodel.recipes._dist_setup import setup_distributed
+from nemo_automodel.recipes._typed_config import RecipeConfig
 from nemo_automodel.recipes.base_recipe import BaseRecipe
-from nemo_automodel.recipes.llm.train_ft import (
-    _get_model_name,
-    build_checkpoint_config,
-    build_dataloader,
-    build_distributed,
-    build_lr_scheduler,
-    build_model,
-    build_optimizer,
-    build_step_scheduler,
-)
+from nemo_automodel.recipes.llm.train_ft import _get_model_name, build_dataloader, build_model
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +45,11 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
     """Recipe for fine-tuning a model for sequence classification."""
 
     def __init__(self, cfg):
-        self.cfg = cfg
+        self.cfg = cfg if isinstance(cfg, RecipeConfig) else RecipeConfig(cfg)
 
     def setup(self):
         torch.cuda.reset_peak_memory_stats()
-        self.dist_env = build_distributed(self.cfg.get("dist_env", {}))
+        self.dist_env = self.cfg.dist_env.build()
         setup_logging()
         apply_cache_compatibility_patches()
         self.rng = StatefulRNG(seed=self.cfg.get("seed", 42), ranked=True)
@@ -67,12 +61,9 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         self.pp_enabled = self.dist_setup.pp_enabled
         self.pipeline_config = self.dist_setup.pipeline_config
 
-        if self.dist_env.is_main and hasattr(self.cfg, "wandb"):
+        if self.dist_env.is_main and self.cfg.wandb is not None:
             suppress_wandb_log_messages()
-            # Reuse helper from NTP recipe
-            from nemo_automodel.recipes._component_builders import build_wandb
-
-            run = build_wandb(self.cfg)
+            run = self.cfg.wandb.build(run_config=self.cfg.to_dict(), model_name=_get_model_name(self.cfg.model))
             logging.info("🚀 View run at {}".format(run.url))
 
         self._log_experiment_details()
@@ -84,12 +75,24 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
         # loss function: standard CE on logits
         self.loss_fn = torch.nn.CrossEntropyLoss()
 
-        checkpoint_config = build_checkpoint_config(
-            self.cfg.get("checkpoint", None),
-            self.cfg.get("model.cache_dir", None),
-            _get_model_name(self.cfg.model),
-            True if self.cfg.get("peft", None) else False,
-        )
+        _ckpt_node = self.cfg.get("checkpoint", None)
+        _ckpt_kwargs = _ckpt_node.to_dict() if _ckpt_node is not None else {}
+        _ckpt_kwargs.pop("restore_from", None)
+        _is_peft = bool(self.cfg.get("peft", None))
+        if _is_peft and _ckpt_kwargs.get("model_save_format") == "torch_save":
+            checkpoint_config = CheckpointingConfig(
+                checkpoint_dir=_ckpt_kwargs.get("checkpoint_dir", "checkpoints/"),
+                model_repo_id=_get_model_name(self.cfg.model),
+                model_cache_dir=self.cfg.get("model.cache_dir", None),
+                is_peft=True,
+            )
+        else:
+            checkpoint_config = CheckpointingConfig(
+                model_repo_id=_get_model_name(self.cfg.model),
+                model_cache_dir=self.cfg.get("model.cache_dir", None),
+                is_peft=_is_peft,
+                **_ckpt_kwargs,
+            )
 
         from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
 
@@ -120,7 +123,10 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             distributed_config=self.distributed_config,
             unfreeze_modules=["classifier"] if self.peft_config is not None else None,
         )
-        self.optimizer = build_optimizer(model, self.cfg.optimizer, self.distributed_config, self.device_mesh)
+        _opt_kwargs = self.cfg.optimizer.to_dict()
+        self.optimizer = build_optimizer_from_factory(
+            _opt_kwargs.pop("_target_"), _opt_kwargs, model, self.distributed_config, self.device_mesh
+        )
 
         self.model_parts = [model]
         self.mfu_calculator = AutoMFU.from_config(self.model_parts[0])
@@ -158,15 +164,18 @@ class TrainFinetuneRecipeForSequenceClassification(BaseRecipe):
             )
 
         self.best_metric_key = self.cfg.get("checkpoint.best_metric_key", "default")
-        self.step_scheduler = build_step_scheduler(
-            self.cfg.get("step_scheduler", None),
+        self.step_scheduler = self.cfg.step_scheduler.build(
             self.dataloader,
             self._get_dp_group_size(),
             local_batch_size=self.cfg.get("step_scheduler.local_batch_size", 1),
         )
         self._setup_garbage_collection(self.step_scheduler)
 
-        self.lr_scheduler = build_lr_scheduler(self.cfg.get("lr_scheduler", None), self.optimizer, self.step_scheduler)
+        self.lr_scheduler = (
+            self.cfg.lr_scheduler.build(self.optimizer, self.step_scheduler)
+            if self.cfg.lr_scheduler is not None
+            else None
+        )
 
         self._log_model_and_optimizer_details(self.model_parts, self.optimizer, self.lr_scheduler)
 

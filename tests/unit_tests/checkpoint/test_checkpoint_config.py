@@ -84,42 +84,16 @@ class TestCheckpointingConfig:
         assert CkptCfg is CheckpointingConfig
 
 
-class TestBuildCheckpointConfig:
-    def test_build_with_defaults(self):
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs=None,
-            cache_dir="/tmp/cache",
-            model_repo_id="test-model",
-            is_peft=False,
-        )
-        assert isinstance(cfg, CheckpointingConfig)
+class TestCheckpointingConfig_Defaults:
+    def test_defaults(self):
+        cfg = CheckpointingConfig(model_cache_dir="/tmp/cache", model_repo_id="test-model", is_peft=False)
         assert cfg.enabled is True
         assert str(cfg.model_cache_dir) == "/tmp/cache"
         assert cfg.model_repo_id == "test-model"
 
-    def test_build_with_user_overrides(self):
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs={"checkpoint_dir": "/my/ckpt", "v4_compatible": True},
-            cache_dir=None,
-            model_repo_id="test",
-            is_peft=False,
+    def test_user_overrides(self):
+        cfg = CheckpointingConfig(
+            model_repo_id="test", is_peft=False, checkpoint_dir="/my/ckpt", v4_compatible=True
         )
         assert str(cfg.checkpoint_dir) == "/my/ckpt"
         assert cfg.v4_compatible is True
-
-    def test_build_peft_torch_save_fallback(self):
-        """PEFT + torch_save should fallback to safetensors, preserving checkpoint_dir."""
-        from nemo_automodel.components.checkpoint.api import build_checkpoint_config
-
-        cfg = build_checkpoint_config(
-            checkpoint_kwargs={"model_save_format": "torch_save", "checkpoint_dir": "/keep/this"},
-            cache_dir=None,
-            model_repo_id="test",
-            is_peft=True,
-        )
-        assert cfg.model_save_format.value == "safetensors"
-        assert str(cfg.checkpoint_dir) == "/keep/this"
