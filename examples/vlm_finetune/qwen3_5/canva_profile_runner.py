@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+import gzip
 import inspect
 import json
 import logging
 import os
 import pathlib
+import shutil
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -65,9 +67,10 @@ def _profile_enabled() -> bool:
 def _make_profiler(*, warmup_steps: int, rank: int) -> torch.profiler.profile | None:
     if not _profile_enabled() or rank != 0:
         return None
+    active_steps = int(os.environ.get("CANVA_PROFILE_ACTIVE_STEPS", "3"))
     return torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=warmup_steps, warmup=1, active=3, repeat=1),
+        schedule=torch.profiler.schedule(wait=warmup_steps, warmup=1, active=active_steps, repeat=1),
         record_shapes=False,
         profile_memory=False,
         with_stack=False,
@@ -102,9 +105,25 @@ def _emit_profile(profiler: torch.profiler.profile, *, framework: str) -> None:
         "CANVA_KERNEL_SUMMARY=%s", json.dumps({"framework": framework, "kernels": summary}, separators=(",", ":"))
     )
 
-    output_dir = pathlib.Path("/opt/nemo-ci/canva_profile")
+    output_dir = pathlib.Path(
+        os.environ.get(
+            "CANVA_PROFILE_DIR",
+            str(pathlib.Path(os.environ.get("CI_PROJECT_DIR", "/opt/nemo-ci")) / "canva_profile"),
+        )
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    profiler.export_chrome_trace(str(output_dir / f"{framework}_rank0.json"))
+    trace_path = output_dir / f"{framework}_rank0.json"
+    compressed_trace_path = trace_path.with_suffix(".json.gz")
+    profiler.export_chrome_trace(str(trace_path))
+    with trace_path.open("rb") as source, gzip.open(compressed_trace_path, "wb", compresslevel=6) as destination:
+        shutil.copyfileobj(source, destination)
+    trace_path.unlink()
+    logger.info(
+        "CANVA_TRACE framework=%s path=%s compressed_bytes=%d",
+        framework,
+        compressed_trace_path,
+        compressed_trace_path.stat().st_size,
+    )
 
 
 def _log_environment(*, framework: str, attention: str, rank: int, world_size: int) -> None:
