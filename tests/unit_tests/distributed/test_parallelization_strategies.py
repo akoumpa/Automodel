@@ -815,7 +815,7 @@ class TestNemotronHParallelizationStrategy:
 
 
 class TestQwen3_5ParallelizationStrategy:
-    """Test the Qwen3.5 dtype-based FSDP strategy."""
+    """Test the Qwen3.5 CP wiring over ordinary layer-owned FSDP."""
 
     @pytest.fixture
     def strategy(self):
@@ -832,8 +832,10 @@ class TestQwen3_5ParallelizationStrategy:
     )
     @patch("nemo_automodel.components.distributed.parallelizer.fully_shard")
     @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_by_dtype")
+    @patch("nemo_automodel.components.distributed.parallelizer_utils.fully_shard_with_per_param_compute_dtypes")
     def test_frozen_multimodal_modules_are_not_separately_sharded(
         self,
+        fully_shard_with_per_param_compute_dtypes,
         fully_shard_by_dtype,
         fully_shard,
         strategy,
@@ -842,7 +844,7 @@ class TestQwen3_5ParallelizationStrategy:
         expected_ignored,
         expected_vision_sharded,
     ):
-        """Qwen3.5 applies all three frozen multimodal policies."""
+        """Qwen3.5 applies frozen policies without dtype-specific child units."""
 
         class MockQwen35Inner(nn.Module):
             def __init__(self):
@@ -864,6 +866,9 @@ class TestQwen3_5ParallelizationStrategy:
         frozen_vision_params = set(model.model.vision_tower.parameters())
         fully_shard.side_effect = lambda model, **kwargs: model
         fully_shard_by_dtype.side_effect = lambda model, *args, **kwargs: model
+        fully_shard_with_per_param_compute_dtypes.side_effect = lambda model, *, fully_shard_fn, **kwargs: (
+            fully_shard_fn(model, **kwargs)
+        )
 
         result = strategy.parallelize(
             model=model,
@@ -871,10 +876,12 @@ class TestQwen3_5ParallelizationStrategy:
             frozen_multimodal_sharding=frozen_multimodal_sharding,
         )
 
-        sharded_by_dtype = [call_args.args[0] for call_args in fully_shard_by_dtype.call_args_list]
+        sharded_modules = [call_args.args[0] for call_args in fully_shard.call_args_list]
         assert result is model
-        assert model.model.layers[0] in sharded_by_dtype
-        assert (model.model.vision_tower.layers[0] in sharded_by_dtype) is expected_vision_sharded
+        assert fully_shard_by_dtype.call_count == 0
+        assert fully_shard_with_per_param_compute_dtypes.call_count == fully_shard.call_count
+        assert model.model.layers[0] in sharded_modules
+        assert (model.model.vision_tower.layers[0] in sharded_modules) is expected_vision_sharded
         root_kwargs = fully_shard.call_args_list[-1].kwargs
         if expected_ignored:
             assert root_kwargs["ignored_params"] == frozen_vision_params

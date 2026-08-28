@@ -48,7 +48,9 @@ def _widest_float_dtype(dtypes: Iterable[Any]) -> Any:
 def patch_fsdp_uniform_reduce_dtype() -> None:
     """Give every FSDP2 reduce-scatter group local gradients of one dtype.
 
-    Gradient accumulation leaves a group holding ``reduce_dtype`` accumulations
+    Per-parameter FSDP compute casting can intentionally produce mixed local
+    gradient dtypes in one ownership group. Gradient accumulation can likewise
+    leave a group holding ``reduce_dtype`` accumulations
     for the parameters used so far, while any parameter whose gradient joins
     later -- a locally unused parameter zero-filled by PyTorch's public API or
     :func:`patch_fsdp_unused_param_reduction`, or one whose gradient lands after
@@ -70,9 +72,9 @@ def patch_fsdp_uniform_reduce_dtype() -> None:
     * ``foreach_reduce`` immediately copies these gradients into a
       ``reduce_dtype`` buffer anyway, so widening first changes no value.
 
-    Uniform groups are passed straight through, so the upstream assertion still
-    fires for genuinely inconsistent gradients such as fp8 weights that fail to
-    produce higher-precision ones. The patch is process-global and idempotent.
+    Uniform groups are passed straight through. Floating-point mixtures are
+    widened losslessly before PyTorch copies them into its configured uniform
+    ``reduce_dtype`` buffer. The patch is process-global and idempotent.
     """
     try:
         import torch.distributed.fsdp._fully_shard._fsdp_collectives as collectives

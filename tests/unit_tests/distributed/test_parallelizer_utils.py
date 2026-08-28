@@ -29,6 +29,7 @@ from nemo_automodel.components.distributed.parallelizer_utils import (
     _mp_policy_with_param_dtype,
     configure_fsdp_unused_param_reduction,
     fully_shard_by_dtype,
+    fully_shard_with_per_param_compute_dtypes,
     get_internal_fsdp_mp_policy,
     iter_maximal_uniform_dtype_subtrees,
     reject_unsupported_mtp_cp,
@@ -684,6 +685,68 @@ def test_make_compute_dtype_fn_fallback_to_policy_then_storage():
     # No policy -> fall back to storage dtype.
     fn_no_policy = _make_compute_dtype_fn(model, None, ())
     assert fn_no_policy(model.a.weight) == torch.float32
+
+
+def test_per_param_compute_casting_keeps_one_fsdp_owner(monkeypatch):
+    """One parent wrap owns FP32 masters while the holder overrides compute dtype."""
+    from nemo_automodel.components.distributed import parallelizer_utils
+
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.projection = nn.Linear(4, 4, bias=False, dtype=torch.float32)
+            self._fp32_params = nn.Module()
+            self._fp32_params.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+
+    mixer = Mixer()
+    mixer.projection.weight._hf_compute_dtype = torch.float16
+    fully_shard_calls = []
+    installed_mappings = []
+    reduce_patch_calls = []
+
+    def fake_fully_shard(module, **kwargs):
+        fully_shard_calls.append((module, kwargs))
+        return module
+
+    def fake_install(module, mapping, policy_dtype):
+        installed_mappings.append((module, mapping, policy_dtype))
+        return 1
+
+    monkeypatch.setattr(parallelizer_utils, "_install_per_param_fsdp_compute_dtypes", fake_install)
+    monkeypatch.setattr(parallelizer_utils, "_patch_fsdp_uniform_reduce_dtype", lambda: reduce_patch_calls.append(1))
+
+    result = fully_shard_with_per_param_compute_dtypes(
+        mixer,
+        fp32_compute_module_names=("_fp32_params",),
+        fully_shard_fn=fake_fully_shard,
+        mesh=object(),
+        mp_policy=_make_mp_policy(),
+        offload_policy=object(),
+    )
+
+    assert result is mixer
+    assert len(fully_shard_calls) == 1
+    assert len(installed_mappings) == 1
+    _, mapping, policy_dtype = installed_mappings[0]
+    assert mapping[(id(mixer.projection), "weight")] is torch.float16
+    assert mapping[(id(mixer._fp32_params), "A_log")] is torch.float32
+    assert policy_dtype is torch.bfloat16
+    assert reduce_patch_calls == [1]
+
+
+def test_per_param_compute_casting_rejects_non_fp32_master():
+    """The casting layer must not silently treat checkpoint BF16 storage as a master."""
+    mixer = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="requires FP32 resident/master weights"):
+        fully_shard_with_per_param_compute_dtypes(
+            mixer,
+            fp32_compute_module_names=(),
+            fully_shard_fn=lambda module, **kwargs: module,
+            mesh=object(),
+            mp_policy=_make_mp_policy(),
+            offload_policy=object(),
+        )
 
 
 def test_fully_shard_by_dtype_fp32_master_pins_compute(monkeypatch):

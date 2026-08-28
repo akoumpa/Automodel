@@ -13,12 +13,14 @@
 # limitations under the License.
 
 from copy import copy
-from typing import Callable, Dict, Iterator, List, Set, Tuple, Union
+from types import MethodType
+from typing import Any, Callable, Dict, Iterator, List, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
     FSDPModule,
     MixedPrecisionPolicy,
     OffloadPolicy,
@@ -339,6 +341,152 @@ def _make_compute_dtype_fn(
         return t.dtype
 
     return compute_dtype_of
+
+
+def _fsdp_pre_all_gather_in_compute_dtype(
+    tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    outer_size: torch.Size,
+    outer_stride: tuple[int, ...],
+    module: nn.Module,
+    mp_policy: MixedPrecisionPolicy,
+) -> tuple[tuple[torch.Tensor, ...], Any]:
+    """Create this FP32 master shard's transient compute-precision all-gather input."""
+    del module, mp_policy
+    compute_dtype = tensor._compute_dtype
+    if outer_size[0] % mesh.size() != 0:
+        raise NotImplementedError(
+            "per-parameter FSDP compute casting requires even dim-0 sharding; "
+            f"got shape {tuple(outer_size)} over {mesh.size()} ranks"
+        )
+    all_gather_input = tensor.to(compute_dtype)
+    metadata = (compute_dtype, outer_size, outer_stride)
+    return (all_gather_input,), metadata
+
+
+def _fsdp_post_all_gather_in_compute_dtype(
+    tensor: torch.Tensor,
+    all_gather_outputs: tuple[torch.Tensor, ...],
+    metadata: Any,
+    param_dtype: torch.dtype,
+    *,
+    out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+    """Expose one gathered parameter in its checkpoint-defined compute dtype."""
+    del tensor, param_dtype
+    compute_dtype, outer_size, outer_stride = metadata
+    (all_gather_output,) = all_gather_outputs
+    if all_gather_output.dtype is not compute_dtype:
+        raise AssertionError(f"expected {compute_dtype} all-gather output, got {all_gather_output.dtype}")
+    if out is not None:
+        if out.dtype is not compute_dtype:
+            raise AssertionError(f"expected {compute_dtype} unsharded parameter, got {out.dtype}")
+        source = torch.as_strided(all_gather_output, outer_size, outer_stride)
+        with torch.autograd._unsafe_preserve_version_counter(out):
+            out.copy_(source)
+        return None
+    return all_gather_output, ()
+
+
+def _install_per_param_fsdp_compute_dtypes(
+    module: nn.Module,
+    compute_dtype_by_owner: dict[tuple[int, str], torch.dtype],
+    policy_dtype: torch.dtype | None,
+) -> int:
+    """Install FSDP tensor extensions on parameters that override the unit policy."""
+    from torch.distributed.fsdp._fully_shard._fsdp_common import compiled_autograd_enabled
+
+    if compiled_autograd_enabled():
+        raise NotImplementedError("per-parameter FSDP compute casting is incompatible with compiled autograd")
+    get_fsdp_state = getattr(module, "_get_fsdp_state", None)
+    if get_fsdp_state is None:
+        raise RuntimeError("per-parameter FSDP compute casting requires a PyTorch FSDPModule")
+    fsdp_state = get_fsdp_state()
+    param_group = getattr(fsdp_state, "_fsdp_param_group", None)
+    if param_group is None:
+        return 0
+
+    installed = 0
+    for fsdp_param in param_group.fsdp_params:
+        module_info = fsdp_param._module_info
+        compute_dtype = compute_dtype_by_owner[(id(module_info.module), module_info.param_name)]
+        default_dtype = policy_dtype or fsdp_param.sharded_param.dtype
+        if compute_dtype is default_dtype:
+            continue
+        local_tensor = fsdp_param._sharded_local_tensor
+        local_tensor._compute_dtype = compute_dtype
+        local_tensor.fsdp_pre_all_gather = MethodType(_fsdp_pre_all_gather_in_compute_dtype, local_tensor)
+        local_tensor.fsdp_post_all_gather = MethodType(_fsdp_post_all_gather_in_compute_dtype, local_tensor)
+        fsdp_param._init_extensions()
+        installed += 1
+    return installed
+
+
+def fully_shard_with_per_param_compute_dtypes(
+    module: nn.Module,
+    *,
+    fp32_compute_module_names: tuple[str, ...],
+    fully_shard_fn: Callable[..., nn.Module] = fully_shard,
+    **fully_shard_kwargs,
+) -> nn.Module:
+    """Fully shard one FP32-master unit with checkpoint-defined parameter compute dtypes.
+
+    FSDP retains one ownership and collective boundary for ``module``. Its normal
+    mixed-precision policy casts ordinary FP32 master shards to ``param_dtype``;
+    parameters resolved to another compute dtype use PyTorch's per-tensor FSDP
+    all-gather extension. Mixed all-gather inputs are packed into one collective.
+
+    Args:
+        module: Module forming one FSDP ownership unit.
+        fp32_compute_module_names: Parameter-name substrings whose transient
+            forward weights must remain FP32.
+        fully_shard_fn: Underlying FSDP2 wrapping function.
+        **fully_shard_kwargs: Arguments forwarded unchanged to ``fully_shard_fn``.
+
+    Returns:
+        The FSDP-wrapped ``module`` returned by ``fully_shard_fn``.
+
+    Raises:
+        ValueError: If a floating master parameter is not resident in FP32.
+        NotImplementedError: If CPU offload or compiled autograd is active, or
+            if a parameter cannot be sharded evenly along dimension zero.
+    """
+    offload_policy = fully_shard_kwargs.get("offload_policy")
+    if isinstance(offload_policy, CPUOffloadPolicy):
+        raise NotImplementedError("per-parameter FSDP compute casting does not support CPU offload")
+
+    mp_policy = fully_shard_kwargs.get("mp_policy")
+    ignored_params = set(fully_shard_kwargs.get("ignored_params") or ())
+    ignored_param_ids = {id(parameter) for parameter in ignored_params}
+    compute_dtype_of = _make_compute_dtype_fn(
+        module,
+        mp_policy,
+        fp32_compute_module_names,
+        ignored_params=ignored_params,
+    )
+    compute_dtype_by_owner: dict[tuple[int, str], torch.dtype] = {}
+    for owner in module.modules():
+        for name, parameter in owner.named_parameters(recurse=False):
+            if id(parameter) in ignored_param_ids:
+                continue
+            if parameter.dtype.is_floating_point and parameter.dtype is not torch.float32:
+                raise ValueError(
+                    "per-parameter FSDP compute casting requires FP32 resident/master weights; "
+                    f"{type(owner).__name__}.{name} is {parameter.dtype}"
+                )
+            compute_dtype_by_owner[(id(owner), name)] = compute_dtype_of(parameter)
+
+    wrapped = fully_shard_fn(module, **fully_shard_kwargs)
+    policy_dtype = getattr(mp_policy, "param_dtype", None)
+
+    def install_extensions(*_args) -> None:
+        installed = _install_per_param_fsdp_compute_dtypes(module, compute_dtype_by_owner, policy_dtype)
+        if installed:
+            _patch_fsdp_uniform_reduce_dtype()
+
+    install_extensions()
+    module.register_load_state_dict_post_hook(install_extensions)
+    return wrapped
 
 
 def fully_shard_by_dtype(
