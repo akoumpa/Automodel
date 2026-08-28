@@ -27,6 +27,9 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: Qwen/Qwen3.5-4B
+  # Match production full-finetune ownership: fp32 resident/master weights,
+  # with FSDP casting the enclosing layer to its transient compute precision.
+  torch_dtype: float32
   backend:
     _target_: nemo_automodel.components.models.common.BackendConfig
     attn: sdpa
