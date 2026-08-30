@@ -39,6 +39,10 @@ rng:
 model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: meta-llama/Llama-3.2-1B
+  # Custom Llama requires TE for packed THD, but TE packed backward is unsupported on SM12X.
+  # HF FlashAttention-2 supports the same packed recipe on Spark.
+  force_hf: true
+  attn_implementation: flash_attention_2
 
 
 peft:
@@ -53,6 +57,8 @@ distributed:
   dp_size: none
   tp_size: 1
   cp_size: 1
+  # The Spark playbook overrides this recipe to Llama-3.1-8B; full AC bounds activation memory on 64 GB UMA.
+  activation_checkpointing: true
 
   sequence_parallel: false
 
