@@ -25,11 +25,16 @@ from typing import Any
 
 from transformers import LlamaConfig
 
+from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
+
 logger = logging.getLogger(__name__)
 
 
-class LlamaStateDictAdapter:
+class LlamaStateDictAdapter(StateDictAdapter):
     """State dict adapter for Llama models.
+
+    Subclassing the common interface makes the adapter checkpoint-compatible;
+    load-path policy remains entirely inside the checkpoint package.
 
     Uses separate projections that match HuggingFace key names exactly, so
     from_hf / to_hf are simple passthroughs (only tied-weight handling in
@@ -75,3 +80,21 @@ class LlamaStateDictAdapter:
         if exclude_key_regex is not None:
             return {k: v for k, v in state_dict.items() if not re.search(exclude_key_regex, k)}
         return dict(state_dict)
+
+    def convert_single_tensor_to_hf(self, fqn: str, tensor: Any, **kwargs) -> list[tuple[str, Any]]:
+        """Return one Llama parameter under its unchanged Hugging Face key.
+
+        Args:
+            fqn: Fully qualified parameter or buffer name in both layouts.
+            tensor: Parameter or buffer tensor of shape ``[...]`` with arbitrary
+                rank and its original model-defined axis order.
+            **kwargs: Conversion options; ``exclude_key_regex`` may omit the tensor.
+
+        Returns:
+            A zero- or one-item list of name/tensor pairs. The returned tensor
+            aliases the input because Llama's native and Hugging Face layouts match.
+        """
+        exclude_key_regex = kwargs.get("exclude_key_regex")
+        if exclude_key_regex is not None and re.search(exclude_key_regex, fqn):
+            return []
+        return [(fqn, tensor)]

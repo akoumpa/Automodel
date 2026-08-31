@@ -60,6 +60,7 @@ from nemo_automodel.components.checkpoint._backports.filesystem import FileSyste
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
+    _is_integrated_cuda_device,
     _maybe_rename_index_for_diffusers,
     get_fqn_to_dtype_mapping,
     get_fqn_to_file_index_mapping,
@@ -862,7 +863,25 @@ class Checkpointer:
             )
         ):
             t0 = time.monotonic()
-            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(model_path)
+            # Full-state safetensors remain mmap-backed. Prefault only when the
+            # destination shares host memory; CPU and discrete-GPU paths stay unchanged.
+            # RTX Spark regression matrix for refactors here:
+            # - llama3_1_8b_squad_peft_rtx_spark.yaml: 64 GB UMA end-to-end guard; set force_hf=false
+            #   for a custom-loader-only smoke test because SM12x cannot run TE packed backward.
+            # - qwen3_8b_squad_rtx_spark.yaml: HF/FA2 packed-training baseline on GB10.
+            # - llama_3_3_70b_instruct_squad_peft_qlora_rtx_spark.yaml: 4-bit streaming guard;
+            #   never full-materialize the 70B checkpoint.
+            model_cuda_devices = {
+                parameter.device
+                for part in model_state.model
+                for parameter in part.parameters()
+                if parameter.device.type == "cuda"
+            }
+            prefault_safetensors = any(_is_integrated_cuda_device(device) for device in model_cuda_devices)
+            state_dict_from_disk = _load_hf_checkpoint_preserving_dtype(
+                model_path,
+                prefault_safetensors=prefault_safetensors,
+            )
             t_disk = time.monotonic()
             if state_dict_from_disk is not None:
                 state_dict_from_disk = _maybe_adapt_state_dict_from_hf(
@@ -2622,7 +2641,11 @@ def _is_custom_model(module: nn.Module) -> bool:
     )
 
 
-def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_checkpoint_preserving_dtype(
+    model_path: str,
+    *,
+    prefault_safetensors: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a HuggingFace checkpoint into a new state dict so tensor dtypes
     match the checkpoint (e.g. bf16). Used when loading the base model so FSDP sees
@@ -2637,19 +2660,40 @@ def _load_hf_checkpoint_preserving_dtype(model_path: str) -> dict[str, torch.Ten
     if _is_bin_checkpoint(model_path):
         return _load_hf_bin_checkpoint(model_path)
     elif _is_safetensors_checkpoint(model_path):
-        return _load_hf_safetensors_checkpoint(model_path)
+        return _load_hf_safetensors_checkpoint(model_path, prefault_mmap=prefault_safetensors)
     return None
 
 
-def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] | None:
+def _load_hf_safetensors_checkpoint(
+    model_path: str,
+    *,
+    prefault_mmap: bool = False,
+) -> dict[str, torch.Tensor] | None:
     """
     Load a safetensors checkpoint into a state dict.
+
+    On integrated CUDA systems, ``prefault_mmap`` reads every file-backed tensor
+    once before installation. This keeps the returned tensors mmap-backed and
+    reclaimable while avoiding page-by-page migration during the later CUDA copy.
     """
     from safetensors import safe_open
 
+    def get_tensor(handle, key: str) -> torch.Tensor:
+        tensor = handle.get_tensor(key)
+        if prefault_mmap:
+            # Fault the mmap pages now, then discard the anonymous copy so the
+            # returned state remains file-backed and reclaimable under pressure.
+            prefaulted = tensor.clone()
+            del prefaulted
+        return tensor
+
     out: dict[str, torch.Tensor] = {}
     if os.path.isfile(model_path):
-        return dict(load_file(model_path))
+        if not prefault_mmap:
+            return dict(load_file(model_path))
+        # load_file hides per-tensor access; safe_open lets us prefault each view.
+        with safe_open(model_path, framework="pt", device="cpu") as f:
+            return {key: get_tensor(f, key) for key in f.keys()}
     # Directory: try index first, then glob
     index_file = os.path.join(model_path, "model.safetensors.index.json")
     if os.path.isfile(index_file):
@@ -2668,12 +2712,12 @@ def _load_hf_safetensors_checkpoint(model_path: str) -> dict[str, torch.Tensor] 
                 available_keys = set(f.keys())
                 for key in keys:
                     if key in available_keys:
-                        out[key] = f.get_tensor(key)
+                        out[key] = get_tensor(f, key)
     else:
         for sf_path in glob.glob(os.path.join(model_path, "*.safetensors")):
             with safe_open(sf_path, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    out[key] = f.get_tensor(key)
+                    out[key] = get_tensor(f, key)
     return out if out else None
 
 
