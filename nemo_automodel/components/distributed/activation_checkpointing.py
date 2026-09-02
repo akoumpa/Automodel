@@ -50,6 +50,34 @@ logger = logging.getLogger(__name__)
 _TORCH_PROFILER_SAC_IGNORE_MIN_VERSION = (2, 13)
 
 
+class _ReusableContext(AbstractContextManager):
+    """Materialize a fresh delegate each time a checkpoint replay enters the context.
+
+    PyTorch's zero-bubble pipeline schedule splits input and weight backward,
+    which can replay the same non-reentrant checkpoint twice. Context managers
+    produced by :func:`contextmanager` are single-use, so checkpoint replay
+    needs a small reusable wrapper around the captured context factory.
+    """
+
+    def __init__(self, context_factory: Callable[[], AbstractContextManager]):
+        self._context_factory = context_factory
+        self._active_contexts: list[AbstractContextManager] = []
+
+    def __enter__(self):
+        context = self._context_factory()
+        self._active_contexts.append(context)
+        try:
+            return context.__enter__()
+        except BaseException:
+            self._active_contexts.pop()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self._active_contexts:
+            raise RuntimeError("Cannot exit a reusable context that is not active")
+        return self._active_contexts.pop().__exit__(exc_type, exc_value, traceback)
+
+
 def unwrap_checkpoint_wrapper(module: nn.Module) -> nn.Module:
     """Return the activation-checkpointed module, or the input module if it is not wrapped.
 
@@ -446,7 +474,7 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
     Returns:
         ``(forward_ctx, recompute_ctx)``: a no-op context for the checkpoint
         forward, and a context restoring the captured SDPA callable and backend
-        set for the backward-time recompute.
+        set for each backward-time recompute.
     """
     captured_sdpa = F.scaled_dot_product_attention
     captured_backends = [
@@ -459,7 +487,7 @@ def sdpa_backend_snapshot_context_fn() -> tuple[AbstractContextManager, Abstract
         )
         if enabled
     ]
-    return nullcontext(), _restore_sdpa_state(captured_sdpa, captured_backends)
+    return nullcontext(), _ReusableContext(lambda: _restore_sdpa_state(captured_sdpa, captured_backends))
 
 
 def _get_transformer_engine_attention_backend_cache() -> dict | None:
@@ -515,10 +543,13 @@ def transformer_engine_attention_backend_snapshot_context_fn(
     cache = _get_transformer_engine_attention_backend_cache()
     if cache is None:
         return forward_context, recompute_context
-    return forward_context, _restore_transformer_engine_attention_backend_cache(
-        cache,
-        dict(cache),
-        recompute_context,
+    captured_cache = dict(cache)
+    return forward_context, _ReusableContext(
+        lambda: _restore_transformer_engine_attention_backend_cache(
+            cache,
+            captured_cache,
+            recompute_context,
+        )
     )
 
 

@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from packaging.version import Version
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper, checkpoint_wrapper
+from torch.distributed.pipelining._backward import stage_backward_input, stage_backward_weight
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import CheckpointError, CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 
@@ -131,6 +132,43 @@ def test_snapshot_context_fn_recompute_ctx_restores_captured_backend_set():
             assert _sdp_backend_state() == _MATH_ONLY
         # The backward-time ambient state is restored once the recompute exits.
         assert _sdp_backend_state() == (True, True, False, False)
+
+
+def test_snapshot_contexts_support_zero_bubble_split_backward(monkeypatch):
+    """Input and weight backward may independently replay one checkpoint region."""
+    attention_cache = {"attention_params": None, "backend": None}
+    monkeypatch.setattr(ac, "_get_transformer_engine_attention_backend_cache", lambda: attention_cache)
+
+    def context_fn():
+        return ac.transformer_engine_attention_backend_snapshot_context_fn(ac.sdpa_backend_snapshot_context_fn)
+
+    reference_checkpointed = nn.Linear(_D, _D)
+    reference_output_projection = nn.Linear(_D, _D)
+    checkpointed = checkpoint_wrapper(
+        copy.deepcopy(reference_checkpointed),
+        context_fn=context_fn,
+    )
+    output_projection = copy.deepcopy(reference_output_projection)
+    parameters = list(checkpointed.parameters()) + list(output_projection.parameters())
+    inputs = torch.randn(2, _D, requires_grad=True)
+    outputs = output_projection(torch.relu(checkpointed(inputs)))
+
+    reference_parameters = list(reference_checkpointed.parameters()) + list(reference_output_projection.parameters())
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    reference_outputs = reference_output_projection(torch.relu(reference_checkpointed(reference_inputs)))
+    reference_outputs.sum().backward()
+
+    _, param_groups = stage_backward_input(
+        [outputs],
+        [torch.ones_like(outputs)],
+        [inputs],
+        iter(parameters),
+    )
+    stage_backward_weight(iter(parameters), param_groups)
+
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad)
+    for parameter, reference_parameter in zip(parameters, reference_parameters):
+        torch.testing.assert_close(parameter.grad, reference_parameter.grad)
 
 
 def test_selective_checkpointing_to_layers_preserves_transformer_engine_attention_cache(monkeypatch):
