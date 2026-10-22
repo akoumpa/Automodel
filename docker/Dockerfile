@@ -136,6 +136,7 @@ RUN if [ "$INSTALL_TE" = "True" ] || \
     git fetch origin "$TE_COMMIT" && \
     git checkout FETCH_HEAD && \
     git submodule update --init --recursive && \
+    uv pip install --system nvidia-cudnn-frontend==1.27.0 && \
     pip install nvidia-mathdx==25.1.1 && \
     env \
         NVTE_FRAMEWORK=pytorch \
