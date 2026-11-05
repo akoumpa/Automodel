@@ -118,6 +118,30 @@ def test_single_document_no_padding():
     assert params.max_seqlen == 4
 
 
+def _run_boundaries(doc_ids: torch.Tensor) -> list[int]:
+    """Reference offsets for IDs [batch, sequence]: equal-ID runs, restarted at every row."""
+    boundaries = [0]
+    for row_index, row in enumerate(doc_ids.tolist()):
+        offset = row_index * len(row)
+        boundaries.extend(offset + position for position in range(1, len(row)) if row[position] != row[position - 1])
+        boundaries.append(offset + len(row))
+    return boundaries
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_cu_seqlens_match_per_row_runs_for_arbitrary_ids(seed):
+    """Interior zero gaps, repeated IDs in separate runs and single-token rows all split segments."""
+    generator = torch.Generator().manual_seed(seed)
+    batch = int(torch.randint(1, 4, (1,), generator=generator))
+    seq = int(torch.randint(1, 24, (1,), generator=generator))
+    doc_ids = torch.randint(0, 3, (batch, seq), generator=generator)
+    params = packed_seq_params_from_doc_ids(doc_ids)
+    expected = _run_boundaries(doc_ids)
+    assert params.cu_seqlens.dtype == torch.int32
+    assert params.cu_seqlens.tolist() == expected
+    assert params.max_seqlen == max(end - start for start, end in zip(expected, expected[1:]))
+
+
 def test_rejects_non_2d():
     with pytest.raises(ValueError, match="2D"):
         packed_seq_params_from_doc_ids(torch.tensor([1, 1, 2, 2]))
