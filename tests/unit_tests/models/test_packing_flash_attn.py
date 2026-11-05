@@ -67,8 +67,8 @@ def test_get_unpad_data_single_doc():
 
 
 @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-def test_collater_flash_emits_varlen_kwargs(impl):
-    """With flash_attention_2, the collater emits FlashAttentionKwargs and no mask."""
+def test_collater_flash_defers_varlen_kwargs_to_model_entry(impl):
+    """With Flash attention, the collater emits document IDs and no mask or offsets."""
     from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
 
     batch = [
@@ -81,14 +81,16 @@ def test_collater_flash_emits_varlen_kwargs(impl):
             "n_videos": 0,
         },
     ]
-    result = neat_packed_vlm_collater(batch, packing=get_packing_capabilities(impl))
+    packing = get_packing_capabilities(impl)
+    result = neat_packed_vlm_collater(batch, packing=packing)
     # No attention_mask so HF takes the varlen-kwargs branch.
     assert "attention_mask" not in result
-    # doc1 (2) + doc2 (3) span the 5 flattened tokens with no padding.
-    assert result["cu_seq_lens_q"].tolist() == [0, 2, 5]
-    assert result["max_length_q"] == 3
-    # Per-document ids preserved for downstream consumers.
+    assert "cu_seq_lens_q" not in result
     assert result["_packed_seq_ids"][0].tolist() == [1, 1, 2, 2, 2]
+    # doc1 (2) + doc2 (3) span the 5 flattened tokens with no padding.
+    flash = packing.prepare_attention_inputs(result["_packed_seq_ids"])
+    assert flash["cu_seq_lens_q"].tolist() == [0, 2, 5]
+    assert flash["max_length_q"] == 3
 
 
 def test_collater_sdpa_returns_4d_mask():

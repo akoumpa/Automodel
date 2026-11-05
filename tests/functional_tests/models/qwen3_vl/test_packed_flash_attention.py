@@ -21,7 +21,7 @@ import torch
 from transformers import Qwen3VLConfig
 
 from nemo_automodel.components.datasets.vlm.collate_fns import neat_packed_vlm_collater
-from nemo_automodel.components.models.common.packing import get_packing_capabilities
+from nemo_automodel.components.models.common.packing import configure_packing, get_packing_capabilities
 from nemo_automodel.components.models.qwen3_vl.model import Qwen3VLForConditionalGeneration
 
 _HAS_FA = torch.cuda.is_available() and importlib.util.find_spec("flash_attn") is not None
@@ -62,8 +62,13 @@ def _build_tiny_qwen3_vl() -> Qwen3VLForConditionalGeneration:
 
 
 @pytest.mark.skipif(not _HAS_FA, reason="requires CUDA and flash-attn")
-def test_packed_flash_attention_with_image_matches_isolated_documents() -> None:
-    """Packed text metadata must reach the language tower without leaking into vision attention."""
+@pytest.mark.parametrize("handoff", ["model_entry", "public_kwargs"])
+def test_packed_flash_attention_with_image_matches_isolated_documents(handoff: str) -> None:
+    """Packed text metadata must reach the language tower without leaking into vision attention.
+
+    ``model_entry`` is the training path: the configured model builds the offsets
+    from compact IDs. ``public_kwargs`` passes HF varlen kwargs directly.
+    """
     model = _build_tiny_qwen3_vl()
     config = model.config
     doc_with_image = [5, config.image_token_id, 9, 13]
@@ -84,9 +89,17 @@ def test_packed_flash_attention_with_image_matches_isolated_documents() -> None:
         "image_grid_thw": image_grid_thw,
         "n_images": 1,
     }
-    batch = neat_packed_vlm_collater(
-        [packed_sample], attn_implementation="flash_attention_2", packing=get_packing_capabilities("flash_attention_2")
-    )
+    packing = get_packing_capabilities("flash_attention_2")
+    batch = neat_packed_vlm_collater([packed_sample], attn_implementation="flash_attention_2", packing=packing)
+    assert "cu_seq_lens_q" not in batch
+    if handoff == "model_entry":
+        configure_packing("flash_attention_2", model=model)
+        attention = {"_packed_seq_ids": batch["_packed_seq_ids"]}  # stays on CPU until model entry
+    else:
+        attention = {
+            key: value.cuda() if isinstance(value, torch.Tensor) else value
+            for key, value in packing.prepare_attention_inputs(batch["_packed_seq_ids"]).items()
+        }
 
     with torch.no_grad():
         packed_logits = model(
@@ -95,10 +108,7 @@ def test_packed_flash_attention_with_image_matches_isolated_documents() -> None:
             pixel_values=batch["pixel_values"].cuda(),
             image_grid_thw=batch["image_grid_thw"].cuda(),
             mm_token_type_ids=batch["mm_token_type_ids"].cuda(),
-            cu_seq_lens_q=batch["cu_seq_lens_q"].cuda(),
-            cu_seq_lens_k=batch["cu_seq_lens_k"].cuda(),
-            max_length_q=batch["max_length_q"],
-            max_length_k=batch["max_length_k"],
+            **attention,
         ).logits[0]
         image_logits = model(
             input_ids=torch.tensor([doc_with_image], device="cuda"),

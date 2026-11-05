@@ -14,7 +14,8 @@
 
 """Model-derived packing contracts and native metadata normalization.
 
-HF flash attention consumes the public varlen kwargs built by dataset collaters.
+HF flash attention consumes public varlen kwargs that the configured model entry
+builds from the collators' batch-major document IDs, after any microbatch split.
 Native FA4 and recurrent consumers use separate unpadded document metadata.
 Neither path modifies Transformers globals.
 """
@@ -620,14 +621,15 @@ def _prepare_flash_metadata_before_input_transfer(
     *,
     attn_implementation: str,
 ) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
-    """Prepare host offsets before FSDP moves the document map to CUDA.
+    """Prepare host offsets before FSDP or DDP moves the document map to CUDA.
 
     PP has already selected the microbatch. Keep text Flash kwargs bundled until
     the decoder hook consumes them: VLM vision towers have their own boundaries
     and must not receive the text offsets through forwarded keyword arguments.
 
     Args:
-        module: Outer model or pipeline stage, before its FSDP input-transfer hook.
+        module: Outermost model (DDP wrapper, FSDP root or pipeline stage), before
+            any input transfer.
         args: Token IDs [batch, sequence] or hidden states [batch, sequence, hidden].
         kwargs: Forward inputs with CPU attention document IDs [batch, sequence].
         attn_implementation: Configured FlashAttention backend.
@@ -651,9 +653,10 @@ def validate_flash_packing_support(attn_implementation: str = "sdpa", model: tor
     """Fail loudly when flash neat packing cannot be consumed by the backend or model.
 
     Neat packing under flash attention relies on the varlen FlashAttention
-    contract: the collater emits ``FlashAttentionKwargs`` (``cu_seq_lens_q``/
-    ``cu_seq_lens_k``/``max_length_q``/``max_length_k``) which HuggingFace threads
-    into ``flash_attn_varlen_func``. This function verifies, before training
+    contract: the model entry builds ``FlashAttentionKwargs`` (``cu_seq_lens_q``/
+    ``cu_seq_lens_k``/``max_length_q``/``max_length_k``) from the collated
+    ``_packed_seq_ids`` map, and HuggingFace threads them into
+    ``flash_attn_varlen_func``. This function verifies, before training
     starts, that (1) the installed Transformers build exposes that contract and
     (2) the model's ``forward`` can actually receive it -- either as ``**kwargs``,
     explicit varlen parameters, or the custom-model ``_packed_seq_ids`` map. Any
@@ -754,7 +757,8 @@ def configure_packing(
     HF attention accepts public masks/varlen kwargs or a CPU batch-major
     attention document map. Maps are materialized at the model-owned entry point
     (HF decoder by default) without modifying Transformers globals. Flash offsets
-    are prepared before FSDP input transfer and exposed only to the text consumer.
+    are prepared on the outermost module, before FSDP or DDP input transfer, and
+    exposed only to the text consumer.
     Native FA4 receives batch-major metadata
     flattened at model entry after microbatch splitting. Other consumers strip
     unused native metadata so it cannot accidentally select their THD path.
@@ -771,6 +775,9 @@ def configure_packing(
         RuntimeError: If HF flash attention cannot consume the public varlen contract.
     """
     capabilities = get_packing_capabilities(attn_implementation, model=model)
+    # Host offsets must precede every input transfer. DDP moves inputs inside its own
+    # forward, before the wrapped module's hooks run, so the hook stays on the wrapper.
+    outer = getattr(model, "_orig_mod", model)
     if attn_implementation == "fa4" and not capabilities.uses_native_fa4:
         target = getattr(model, "module", model)
         target = getattr(target, "_orig_mod", target)
@@ -812,17 +819,17 @@ def configure_packing(
                 ),
                 with_kwargs=True,
             )
-        flash_handle = getattr(uncompiled, "_packed_flash_preparation_hook_handle", None)
+        flash_handle = getattr(outer, "_packed_flash_preparation_hook_handle", None)
         if capabilities.packed_mask_type == "flash_varlen" and flash_handle is None:
-            # FSDP transfers CPU tensor kwargs before entering the text decoder.
-            uncompiled._packed_flash_preparation_hook_handle = uncompiled.register_forward_pre_hook(
+            # FSDP and DDP transfer CPU tensor kwargs before entering the text decoder.
+            outer._packed_flash_preparation_hook_handle = outer.register_forward_pre_hook(
                 partial(_prepare_flash_metadata_before_input_transfer, attn_implementation=attn_implementation),
                 with_kwargs=True,
                 prepend=True,
             )
         elif capabilities.packed_mask_type != "flash_varlen" and flash_handle is not None:
             flash_handle.remove()
-            del uncompiled._packed_flash_preparation_hook_handle
+            del outer._packed_flash_preparation_hook_handle
     return capabilities
 
 

@@ -191,6 +191,40 @@ class TestConfigurePacking:
         model(torch.ones(1, 4, dtype=torch.long), _packed_seq_ids=torch.tensor([[1, 1, 2, 2]]))
         assert seen == [[0, 2, 4]]
 
+    def test_flash_metadata_precedes_ddp_style_wrapper_input_transfer(self):
+        class Capture(torch.nn.Module):
+            def forward(self, input_ids, **kwargs):
+                """Return keyword inputs for tokens of shape [batch, sequence]."""
+                return kwargs
+
+        class MovingWrapper(torch.nn.Module):
+            """Move nested tensor inputs before the wrapped call, as DDP does with device_ids."""
+
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                """Call the module with every tensor, including nested ones, on the meta device."""
+
+                def move(value):
+                    if isinstance(value, torch.Tensor):
+                        return value.to("meta")
+                    if isinstance(value, dict):
+                        return {key: move(item) for key, item in value.items()}
+                    return value
+
+                return self.module(*(move(arg) for arg in args), **move(kwargs))
+
+        wrapper = MovingWrapper(Capture())
+        configure_packing("flash_attention_2", model=wrapper)
+        assert "_packed_flash_preparation_hook_handle" in wrapper.__dict__
+        output = wrapper(torch.ones(1, 4, dtype=torch.long), _packed_seq_ids=torch.tensor([[1, 1, 2, 2]]))
+        # The offsets were built from host IDs before the wrapper moved them.
+        assert output["cu_seq_lens_q"].device.type == "meta"
+        assert output["cu_seq_lens_q"].shape == (3,)
+        assert output["max_length_q"] == output["max_length_k"] == 2
+
     def test_flash_attention_map_is_resolved_after_microbatch_split(self):
         class Capture(torch.nn.Module):
             def forward(self, input_ids, **kwargs):

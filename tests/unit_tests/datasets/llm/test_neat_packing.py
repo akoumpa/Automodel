@@ -427,16 +427,19 @@ class TestNeatPackedCollaterContracts:
         ]
 
     @pytest.mark.parametrize("impl", ["flash_attention_2", "flash_attention_3", "flash_attention_4"])
-    def test_flash_versions_emit_varlen_kwargs_and_no_mask(self, impl):
-        out = neat_packed_collater(self._batch(), attn_implementation=impl, packing=get_packing_capabilities(impl))
+    def test_flash_versions_leave_offsets_to_model_entry(self, impl):
+        packing = get_packing_capabilities(impl)
+        out = neat_packed_collater(self._batch(), attn_implementation=impl, packing=packing)
         # No attention_mask so HF takes the varlen-kwargs branch (not _upad_input).
         assert "attention_mask" not in out
-        # cu_seqlens spans the full flattened batch: doc1 (2) + doc2 (2) = 4 tokens.
-        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]
-        assert torch.equal(out["cu_seq_lens_q"], out["cu_seq_lens_k"])
-        assert out["max_length_q"] == out["max_length_k"] == 2
-        # Per-document ids preserved for loss / context-parallel consumers.
+        # Offsets span the flattened batch, so the model entry builds them after any split.
+        assert "cu_seq_lens_q" not in out
         assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
+        # The model-owned conversion: doc1 (2) + doc2 (2) = 4 tokens.
+        flash = packing.prepare_attention_inputs(out["_packed_seq_ids"])
+        assert flash["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert torch.equal(flash["cu_seq_lens_q"], flash["cu_seq_lens_k"])
+        assert flash["max_length_q"] == flash["max_length_k"] == 2
 
     def test_document_ids_contract_keeps_indexed_2d_mask(self):
         packing = PackingCapabilities(
@@ -490,4 +493,5 @@ class TestNeatPackedCollaterContracts:
             )
 
         assert "attention_mask" not in out
-        assert out["cu_seq_lens_q"].tolist() == [0, 2, 4]
+        assert "cu_seq_lens_q" not in out
+        assert out["_packed_seq_ids"].tolist() == [[1, 1, 2, 2]]
